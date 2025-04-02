@@ -1,152 +1,404 @@
+process.env.NODE_OPTIONS = '--no-deprecation'
+require('punycode').ucs2 || {}
+
+const punycode = require('punycode/')
+require('dotenv').config()
+
 const { Telegraf } = require('telegraf')
+const Binance = require('node-binance-api')
 const axios = require('axios')
 
-// Config
-const BOT_TOKEN = '7964955582:AAF5shEezUdS-WFqTmvIrXwnk7uHAkx-MWY' // Ganti dengan token bot Anda
-let btcAmount = 0.00020881
-let priceSubscribers = [] // Array untuk menyimpan chat ID yang berlangganan
-let priceInterval = null // Variabel untuk menyimpan interval
-let alerts = [] // Array untuk menyimpan alert: { chatId, targetPrice }
+// Tambahkan ini di paling atas file
+process.removeAllListeners('warning')
 
-// Inisialisasi Bot
+// Cek environment variables
+if (!process.env.TELEGRAM_BOT_TOKEN) {
+  console.error('❌ TELEGRAM_BOT_TOKEN tidak ada di .env!')
+  process.exit(1)
+}
+
+if (!process.env.BINANCE_API_KEY || !process.env.BINANCE_API_SECRET) {
+  console.error('❌ Binance API keys tidak ada di .env!')
+  process.exit(1)
+}
+
+// Init Binance dengan environment variables
+const binance = new Binance().options({
+  APIKEY: process.env.BINANCE_API_KEY,
+  APISECRET: process.env.BINANCE_API_SECRET,
+  recvWindow: 60000,
+  family: 4,
+  timeout: 15000,
+  urls: {
+    base: 'https://api.binance.com/api/',
+    stream: 'wss://stream.binance.com:9443/ws'
+  },
+  verbose: true,
+  log: (log) => {
+    console.log('📡 Binance API Log:', log)
+  }
+})
+
+// Config
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN
+let priceSubscribers = []
+let priceTimeout = null
+let dailyResetData = {
+    lastReset: null,
+    btcSnapshot: 0,
+    priceSnapshot: 0
+}
+
+// Init Bot
 const bot = new Telegraf(BOT_TOKEN)
 
-// Command handlers
-bot.command('ping', (ctx) => ctx.reply('🏓 Pong!'))
-bot.command('btc', async (ctx) => {
-    const price = await getBTCPrice()
-    ctx.reply(`💰 Harga Bitcoin: $${price.toFixed(2)}`)
-})
-bot.command('saldo', async (ctx) => {
-    const price = await getBTCPrice()
-    const usdValue = btcAmount * price
-    ctx.reply(`📊 Saldo BTC: ${btcAmount} BTC\n💵 Nilai USDT: ${usdValue.toFixed(2)}`)
-})
-bot.command('ts', async (ctx) => {
-    const [command, amount] = ctx.message.text.split(' ')
-    const tambah = parseFloat(amount)
-    
-    if (!isNaN(tambah) && tambah > 0) {
-        btcAmount += tambah
-        const price = await getBTCPrice()
-        const usdValue = btcAmount * price
-        ctx.reply(`✅ Berhasil tambah ${tambah} BTC!\n\nTotal BTC: ${btcAmount.toFixed(8)}\nNilai USDT: ${usdValue.toFixed(2)}`)
-    } else {
-        ctx.reply('❌ Format salah! Contoh: /ts 0.0001')
-    }
-})
-bot.command('startprice', (ctx) => {
-    if (!priceSubscribers.includes(ctx.chat.id)) {
-        priceSubscribers.push(ctx.chat.id)
-        ctx.reply('🔔 Akan mengirim update harga BTC/USDT setiap 30 detik!\nGunakan /stopprice untuk berhenti')
-        
-        // Mulai interval jika belum aktif
-        if (!priceInterval) {
-            priceInterval = setInterval(sendPriceUpdates, 30000)
-        }
-    } else {
-        ctx.reply('❌ Anda sudah berlangganan update harga!')
-    }
-})
-bot.command('stopprice', (ctx) => {
-    priceSubscribers = priceSubscribers.filter(id => id !== ctx.chat.id)
-    ctx.reply('🔕 Berhenti mengirim update harga')
-    
-    // Hentikan interval jika tidak ada subscriber
-    if (priceSubscribers.length === 0 && priceInterval) {
-        clearInterval(priceInterval)
-        priceInterval = null
-    }
-})
-bot.command('setalert', (ctx) => {
-    const [_, targetPrice] = ctx.message.text.split(' ')
-    const price = parseFloat(targetPrice)
-    
-    if (!isNaN(price) && price > 0) {
-        alerts.push({
-            chatId: ctx.chat.id,
-            targetPrice: price
-        })
-        ctx.reply(`🔔 Alert aktif! Akan diberitahu ketika harga mencapai $${price.toFixed(2)}`)
-    } else {
-        ctx.reply('❌ Format salah! Contoh: /setalert 70000')
-    }
-})
-bot.command('myalerts', (ctx) => {
-    const userAlerts = alerts.filter(a => a.chatId === ctx.chat.id)
-    if (userAlerts.length > 0) {
-        const alertList = userAlerts.map(a => `- $${a.targetPrice.toFixed(2)}`).join('\n')
-        ctx.reply(`📋 Daftar Alert Anda:\n${alertList}`)
-    } else {
-        ctx.reply('❌ Anda belum memiliki alert aktif')
-    }
-})
+// Helper functions
+async function getBTCBalance() {
+  try {
+    const account = await binance.balance()
+    return parseFloat(account.BTC.available)
+  } catch (error) {
+    console.error('Error ambil saldo:', error)
+    return null
+  }
+}
 
-// Helper function
 async function getBTCPrice() {
-    const { data } = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT')
-    return parseFloat(data.price)
+  try {
+    const ticker = await binance.prices('BTCUSDT')
+    return parseFloat(ticker.BTCUSDT)
+  } catch (error) {
+    console.error('Error ambil harga:', error)
+    return null
+  }
 }
 
-// Fungsi untuk mengirim update harga
-async function sendPriceUpdates() {
-    try {
-        const price = await getBTCPrice()
-        const usdValue = btcAmount * price
-        const message = `🔄 Update Terkini:
-💰 BTC/USDT: $${price.toFixed(2)}
-📊 Saldo BTC: ${btcAmount.toFixed(8)} BTC
-💵 Nilai USDT: ${usdValue.toFixed(2)}`
-        
-        // Kirim ke semua subscriber
-        for (const chatId of priceSubscribers) {
-            try {
-                await bot.telegram.sendMessage(chatId, message)
-            } catch (error) {
-                console.error(`Gagal mengirim ke ${chatId}:`, error.message)
-                // Hapus subscriber jika terjadi error
-                priceSubscribers = priceSubscribers.filter(id => id !== chatId)
-            }
-        }
-
-        // Cek alert
-        const triggeredAlerts = []
-        for (const alert of alerts) {
-            if (price >= alert.targetPrice) {
-                try {
-                    await bot.telegram.sendMessage(
-                        alert.chatId,
-                        `🚨 ALERT TERPENUHI!\nHarga BTC mencapai $${price.toFixed(2)} (Target: $${alert.targetPrice.toFixed(2)})`
-                    )
-                    triggeredAlerts.push(alert)
-                } catch (error) {
-                    console.error(`Gagal mengirim alert ke ${alert.chatId}:`, error.message)
-                }
-            }
-        }
-        
-        // Hapus alert yang sudah terpicu
-        alerts = alerts.filter(alert => !triggeredAlerts.includes(alert))
-
-    } catch (error) {
-        console.error('Error mendapatkan harga:', error.message)
+// Scheduler reset harian
+async function scheduleDailyReset() {
+    const now = new Date();
+    
+    // Set target jam 7 WIB besok
+    const target = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Jakarta' }));
+    target.setHours(7, 0, 0, 0);
+    if(target <= now) {
+        target.setDate(target.getDate() + 1); // Tambah 1 hari jika sudah lewat jam 7
     }
+
+    const timeout = target - now;
+    
+    console.log('⏳ Next reset at:', target.toLocaleString('id-ID', { 
+        timeZone: 'Asia/Jakarta',
+        hour12: false 
+    }));
+    
+    setTimeout(async () => {
+        console.log('🔁 Memulai proses reset harian...');
+        const [btcAmount, price] = await Promise.all([
+            getBTCBalance(),
+            getBTCPrice()
+        ])
+        
+        if(btcAmount === null || price === null) {
+            console.error('Gagal reset harian, coba lagi dalam 5 menit...')
+            return setTimeout(scheduleDailyReset, 300000) // Retry in 5 minutes
+        }
+        
+        const previousDayProfit = (dailyResetData.btcSnapshot * price) - 
+                                (dailyResetData.btcSnapshot * dailyResetData.priceSnapshot)
+        
+        dailyResetData = {
+            lastReset: new Date().toLocaleString('id-ID', { 
+                timeZone: 'Asia/Jakarta',
+                hour12: false 
+            }),
+            btcSnapshot: btcAmount,
+            priceSnapshot: price,
+            previousProfit: previousDayProfit
+        }
+        
+        const message = `⏰ *Reset Harian 07:00 WIB*\n` +
+        `📌 Saldo BTC: \`${btcAmount.toFixed(8)}\`\n` +
+        `💰 Harga Reset: \`$${price.toFixed(2)}\`\n` +
+        `📈 Profit Hari Ini: \`$${previousDayProfit.toFixed(2)}\``
+        
+        for(const chatId of priceSubscribers) {
+            await bot.telegram.sendMessage(chatId, message)
+        }
+        
+        console.log('✅ Reset harian selesai:', dailyResetData)
+        scheduleDailyReset()
+    }, timeout);
 }
 
-// Update help command
-bot.command('help', (ctx) => {
-    ctx.replyWithMarkdown(`
-    *📚 Daftar Command:*
-    /btc - Harga Bitcoin
-    /saldo - Cek saldo
-    /ts [amount] - Tambah saldo
-    /startprice - Auto update harga
-    /stopprice - Stop update
-    /setalert [price] - Set harga alert
-    /myalerts - Lihat daftar alert
-    `)
+// Command Utama
+bot.command('btc', async (ctx) => {
+  const price = await getBTCPrice()
+  if(!price) return ctx.reply('❌ Gagal ambil harga')
+  
+  ctx.reply(`💰 *Harga BTC/USDT*: $${price.toFixed(2)}`, { parse_mode: 'Markdown' })
 })
 
-// Jalankan bot
-bot.launch()
-console.log('🤖 Bot Telegram aktif!') 
+bot.command('saldo', async (ctx) => {
+  const [btcAmount, price] = await Promise.all([getBTCBalance(), getBTCPrice()])
+  
+  if(!btcAmount || !price) {
+    return ctx.reply('❌ Data tidak tersedia')
+  }
+  
+  const usdValue = btcAmount * price
+  const pnlUSD = (btcAmount * price) - (dailyResetData.btcSnapshot * dailyResetData.priceSnapshot)
+  const pnlPercent = ((price / dailyResetData.priceSnapshot - 1) * 100).toFixed(2)
+  
+  ctx.replyWithMarkdown(
+    `📊 *Saldo Anda*\n` +
+    `🪙 BTC: \`${btcAmount.toFixed(8)}\`\n` +
+    `💵 USD: \`$${usdValue.toFixed(2)}\`\n` +
+    `📈 *PNL Hari Ini*\n` +
+    `🔄 USD: \`${pnlUSD >= 0 ? '+' : '-'}$${Math.abs(pnlUSD).toFixed(2)}\`\n` +
+    `📊 Persentase: \`${pnlPercent}%\``
+  )
+})
+
+bot.command('startprice', async (ctx) => {
+  if(!priceSubscribers.includes(ctx.chat.id)) {
+    priceSubscribers.push(ctx.chat.id)
+    
+    const [btcAmount, price] = await Promise.all([getBTCBalance(), getBTCPrice()])
+    const usdValue = btcAmount * price
+    const pnlUSD = (btcAmount * price) - (dailyResetData.btcSnapshot * dailyResetData.priceSnapshot)
+    
+    await ctx.replyWithMarkdown(
+      `⏰ *Auto Update Per Jam Diaktifkan*\\!\n` +
+      `Saldo Awal:\n` +
+      `🪙 BTC: \`${btcAmount.toFixed(8)}\`\n` +
+      `💵 USD: \`$${usdValue.toFixed(2)}\`\n` +
+      `📈 PNL Saat Ini: \`${pnlUSD >= 0 ? '🟢+' : '🔴-'}$${Math.abs(pnlUSD).toFixed(2)}\``
+    )
+    
+    if(!priceTimeout) {
+      scheduleHourlyUpdates()
+      console.log('⏳ Auto-update per jam dimulai')
+    }
+  } else {
+    ctx.reply('❌ Anda sudah berlangganan update')
+  }
+})
+
+bot.command('stopprice', (ctx) => {
+  priceSubscribers = priceSubscribers.filter(id => id !== ctx.chat.id)
+  ctx.reply('🔕 Berhenti update harga')
+  
+  if(priceSubscribers.length === 0 && priceTimeout) {
+    clearTimeout(priceTimeout)
+    priceTimeout = null
+  }
+})
+
+bot.command('pnl', async (ctx) => {
+  // Dapatkan data terkini
+  const [currentBtc, currentPrice] = await Promise.all([
+    getBTCBalance(),
+    getBTCPrice()
+  ])
+
+  // Validasi data
+  if(!currentBtc || !currentPrice || !dailyResetData.priceSnapshot) {
+    return ctx.reply('❌ Data belum tersedia, coba lagi nanti')
+  }
+
+  // Hitung nilai awal dan sekarang
+  const initialValue = dailyResetData.btcSnapshot * dailyResetData.priceSnapshot
+  const currentValue = currentBtc * currentPrice
+  const pnlUSD = currentValue - initialValue
+  const pnlPercent = initialValue !== 0 
+    ? ((currentValue / initialValue - 1) * 100).toFixed(2)
+    : 'N/A'
+
+  // Format pesan
+  const message = 
+    `📊 *Profit/Loss Harian* (Sejak ${dailyResetData.lastReset})\n` +
+    `├─ 🪙 BTC Awal: \`${dailyResetData.btcSnapshot.toFixed(8)}\`\n` +
+    `├─ 💰 Harga Awal: \`$${dailyResetData.priceSnapshot.toFixed(2)}\`\n` +
+    `├─ 🪙 BTC Sekarang: \`${currentBtc.toFixed(8)}\`\n` +
+    `├─ 💹 Harga Sekarang: \`$${currentPrice.toFixed(2)}\`\n` +
+    `├─ 📈 PNL USD: \`${pnlUSD >= 0 ? '🟢+' : '🔴-'}$${Math.abs(pnlUSD).toFixed(2)}\`\n` +
+    `└─ 📉 Persentase: \`${pnlUSD >= 0 ? '+' : '-'}${pnlPercent}%\``
+
+  ctx.replyWithMarkdown(message)
+})
+
+bot.command('porto', async (ctx) => {
+  const [btcAmount, price] = await Promise.all([getBTCBalance(), getBTCPrice()])
+  
+  if(!btcAmount || !price) {
+    return ctx.reply('❌ Gagal ambil data')
+  }
+  
+  const priceChange = ((price / dailyResetData.priceSnapshot - 1) * 100).toFixed(2)
+  const usdValue = btcAmount * price
+  
+  ctx.replyWithMarkdown(
+    `📊 *Portfolio Harian*\n` +
+    `🕒 Reset Terakhir: \`${dailyResetData.lastReset}\`\n\n` +
+    `🪙 *BTC*\n` +
+    `Saldo: \`${btcAmount.toFixed(8)}\`\n` +
+    `Harga: \`$${price.toFixed(2)}\`\n\n` +
+    `💵 *Nilai Total*\n` +
+    `USD: \`$${usdValue.toFixed(2)}\`\n\n` +
+    `📈 *Perubahan*\n` +
+    `Harga: \`${priceChange}%\`\n` +
+    `PNL: \`$${(usdValue - (dailyResetData.btcSnapshot * dailyResetData.priceSnapshot)).toFixed(2)}\``
+  )
+})
+
+bot.command('help', (ctx) => {
+  ctx.replyWithMarkdownV2(`
+📋 DAFTAR COMMAND \\[v1\\.0\\]
+
+🪙 *Portfolio*
+/btc \\- Cek harga BTC terkini
+/saldo \\- Lihat saldo BTC & USD
+/porto \\- Laporan portfolio harian
+/pnl \\- Profit/Loss sejak reset terakhir
+
+⏰ *Auto Update*
+/startprice \\- Update harga & saldo per jam \\(00 menit\\)
+/stopprice \\- Berhenti update harga
+
+🔄 *Reset & Tools*
+/resetnow \\- Paksa reset harian \\(admin\\)
+/cekreset \\- Cek data reset terakhir
+
+ℹ️ *Lainnya*
+/help \\- Tampilkan menu ini
+
+📌 *Catatan:*
+\\- Reset harian otomatis jam 07\\.00 WIB
+\\- Data PNL dihitung sejak reset terakhir
+\\- Update harga real\\-time dari Binance
+  `)
+})
+
+// Tambahkan command reset manual (testing)
+bot.command('resetnow', async (ctx) => {
+  await scheduleDailyReset()
+  ctx.reply('🔄 Reset manual berhasil!')
+})
+
+// Fungsi Utilitas
+async function sendPriceUpdates() {
+  try {
+    const [btcAmount, price] = await Promise.all([getBTCBalance(), getBTCPrice()])
+    if(!btcAmount || !price) return
+    
+    const usdValue = btcAmount * price
+    const pnlUSD = (btcAmount * price) - (dailyResetData.btcSnapshot * dailyResetData.priceSnapshot)
+    const pnlPercent = ((price / dailyResetData.priceSnapshot - 1) * 100).toFixed(2)
+    
+    for(const chatId of priceSubscribers) {
+      await bot.telegram.sendMessage(
+        chatId,
+        `🔄 *Update Real-Time*:\n` +
+        `🪙 BTC: \`${btcAmount.toFixed(8)}\`\n` +
+        `💰 Harga: \`$${price.toFixed(2)}\`\n` +
+        `💵 Nilai: \`$${usdValue.toFixed(2)}\`\n` +
+        `📈 PNL Harian: \`${pnlUSD >= 0 ? '🟢+' : '🔴-'}$${Math.abs(pnlUSD).toFixed(2)} (${pnlPercent}%)\``,
+        { parse_mode: 'Markdown' }
+      )
+    }
+  } catch(error) {
+    console.error('🚨 Error di sendPriceUpdates:', error)
+  }
+}
+
+// Fungsi scheduler baru
+function scheduleHourlyUpdates() {
+  const now = new Date()
+  const nextHour = new Date(now)
+  nextHour.setHours(nextHour.getHours() + 1)
+  nextHour.setMinutes(0, 0, 0) // Set ke menit 00
+  
+  const timeout = nextHour - now
+  
+  priceTimeout = setTimeout(async () => {
+    await sendPriceUpdates()
+    scheduleHourlyUpdates() // Jadwalkan lagi untuk jam berikutnya
+  }, timeout)
+  
+  console.log('⏳ Next update at:', nextHour.toLocaleTimeString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    hour12: false
+  }))
+}
+
+// 1. Add keep-alive mechanism at the top
+const keepAlive = () => {
+  setInterval(() => {
+    console.log('❤️  Heartbeat:', new Date().toLocaleTimeString('id-ID', { 
+      timeZone: 'Asia/Jakarta',
+      hour12: false 
+    }))
+  }, 30000)
+}
+
+// 2. Enhanced main function
+async function main() {
+  try {
+    console.log('🚀 Starting initialization...')
+    
+    // Test Binance connection first
+    console.log('🔌 Testing Binance connection...')
+    const binanceTime = await binance.futuresTime()
+    console.log('✅ Binance connected | Server Time:', new Date(binanceTime))
+    
+    // Start Telegram bot
+    console.log('🤖 Launching Telegram bot...')
+    await bot.launch()
+    console.log('✅ Bot active:', (await bot.telegram.getMe()).username)
+    
+    // Jalankan reset pertama kali
+    await scheduleDailyReset()
+    // Baru mulai scheduler
+    scheduleDailyReset()
+    
+    // Keep process alive
+    console.log('🔄 Starting keep-alive mechanism...')
+    keepAlive()
+    
+    console.log('🌈 Bot fully operational!')
+    
+  } catch (error) {
+    console.error('💥 Critical initialization error:', error)
+    process.exit(1)
+  }
+}
+
+// 3. Global error handling
+process.on('uncaughtException', (error) => {
+  console.error('🚨 Uncaught Exception:', error)
+  // Restart logic can be added here
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ Unhandled Rejection at:', promise, 'Reason:', reason)
+})
+
+// 4. Start the bot
+main()
+  .then(() => console.log('🎉 Bot startup completed'))
+  .catch((err) => console.error('🔥 Failed to start bot:', err))
+
+// Di akhir file sebelum bot.launch()
+bot.catch((err, ctx) => {
+  console.error('🚨 Global Error:', err)
+  ctx.reply('❌ Terjadi kesalahan sistem')
+})
+
+bot.command('cekreset', (ctx) => {
+  ctx.replyWithMarkdown(
+    `🔍 *Data Reset Terakhir:*\n` +
+    `⏰ Waktu: \`${dailyResetData.lastReset || 'Belum ada'}\`\n` +
+    `🪙 BTC: \`${dailyResetData.btcSnapshot || 0}\`\n` +
+    `💰 Harga: \`$${dailyResetData.priceSnapshot || 0}\``
+  )
+})
